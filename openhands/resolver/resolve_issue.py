@@ -1,7 +1,16 @@
 import argparse
 import asyncio
+import os
+from argparse import Namespace
 
+from pydantic import SecretStr
+
+from openhands.core.config import LLMConfig
+from openhands.integrations.service_types import ProviderType
+from openhands.resolver.issue_handler_factory import IssueHandlerFactory
 from openhands.resolver.issue_resolver import IssueResolver
+from openhands.resolver.utils import identify_token
+from openhands.utils.async_utils import GENERAL_TIMEOUT, call_async_from_sync
 
 
 def int_or_none(value: str) -> int | None:
@@ -91,9 +100,116 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-
-    resolver = IssueResolver(args)
+    resolver = build_issue_resolver(args)
     asyncio.run(resolver.resolve_issue())
+
+
+def build_issue_resolver(args: Namespace) -> IssueResolver:
+    """Build an IssueResolver instance from command line arguments."""
+    # Setup and validate container images
+    sandbox_config = IssueResolver._setup_sandbox_config(
+        args.base_container_image,
+        args.runtime_container_image,
+        args.is_experimental,
+    )
+
+    parts = args.selected_repo.rsplit('/', 1)
+    if len(parts) < 2:
+        raise ValueError('Invalid repository format. Expected owner/repo')
+    owner, repo = parts
+
+    token = args.token or os.getenv('GITHUB_TOKEN') or os.getenv('GITLAB_TOKEN')
+    username = args.username if args.username else os.getenv('GIT_USERNAME')
+    if not username:
+        raise ValueError('Username is required.')
+
+    if not token:
+        raise ValueError('Token is required.')
+
+    platform = call_async_from_sync(
+        identify_token,
+        GENERAL_TIMEOUT,
+        token,
+        args.base_domain,
+    )
+
+    api_key = args.llm_api_key or os.environ['LLM_API_KEY']
+    model = args.llm_model or os.environ['LLM_MODEL']
+    base_url = args.llm_base_url or os.environ.get('LLM_BASE_URL', None)
+    api_version = os.environ.get('LLM_API_VERSION', None)
+    llm_num_retries = int(os.environ.get('LLM_NUM_RETRIES', '4'))
+    llm_retry_min_wait = int(os.environ.get('LLM_RETRY_MIN_WAIT', '5'))
+    llm_retry_max_wait = int(os.environ.get('LLM_RETRY_MAX_WAIT', '30'))
+    llm_retry_multiplier = int(os.environ.get('LLM_RETRY_MULTIPLIER', 2))
+    llm_timeout = int(os.environ.get('LLM_TIMEOUT', 0))
+
+    # Create LLMConfig instance
+    llm_config = LLMConfig(
+        model=model,
+        api_key=SecretStr(api_key) if api_key else None,
+        base_url=base_url,
+        num_retries=llm_num_retries,
+        retry_min_wait=llm_retry_min_wait,
+        retry_max_wait=llm_retry_max_wait,
+        retry_multiplier=llm_retry_multiplier,
+        timeout=llm_timeout,
+    )
+
+    if api_version is not None:
+        llm_config.api_version = api_version
+
+    repo_instruction = None
+    if args.repo_instruction_file:
+        with open(args.repo_instruction_file, 'r') as f:
+            repo_instruction = f.read()
+
+    issue_type = args.issue_type
+
+    # Read the prompt template
+    prompt_file = args.prompt_file
+    if prompt_file is None:
+        if issue_type == 'issue':
+            prompt_file = os.path.join(
+                os.path.dirname(__file__), 'prompts/resolve/basic-with-tests.jinja'
+            )
+        else:
+            prompt_file = os.path.join(
+                os.path.dirname(__file__), 'prompts/resolve/basic-followup.jinja'
+            )
+    with open(prompt_file, 'r') as f:
+        prompt_template = f.read()
+
+    base_domain = args.base_domain
+    if base_domain is None:
+        base_domain = 'github.com' if platform == ProviderType.GITHUB else 'gitlab.com'
+
+    factory = IssueHandlerFactory(
+        owner=owner,
+        repo=repo,
+        token=token,
+        username=username,
+        platform=platform,
+        base_domain=base_domain,
+        issue_type=issue_type,
+        llm_config=llm_config,
+    )
+    issue_handler = factory.create()
+
+    return IssueResolver(
+        owner=owner,
+        repo=repo,
+        platform=platform,
+        max_iterations=args.max_iterations,
+        output_dir=args.output_dir,
+        llm_config=llm_config,
+        prompt_template=prompt_template,
+        issue_type=issue_type,
+        repo_instruction=repo_instruction,
+        issue_number=args.issue_number,
+        comment_id=args.comment_id,
+        sandbox_config=sandbox_config,
+        issue_handler=issue_handler,
+    )
 
 
 if __name__ == '__main__':
