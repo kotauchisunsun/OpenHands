@@ -437,7 +437,7 @@ class IssueResolver:
     async def resolve_issue(
         self,
         reset_logger: bool = False,
-    ) -> None:
+    ) -> ResolverOutput | None:
         """Resolve a single issue."""
         # Load dataset
         issues: list[Issue] = self.issue_handler.get_converted_issues(
