@@ -16,8 +16,6 @@ from openhands.events.action import CmdRunAction, MessageAction
 from openhands.events.event import Event
 from openhands.events.observation import (
     CmdOutputObservation,
-    ErrorObservation,
-    Observation,
 )
 from openhands.events.stream import EventStreamSubscriber
 from openhands.integrations.service_types import ProviderType
@@ -68,32 +66,48 @@ class IssueResolver:
         self.sandbox_config = sandbox_config
         self.issue_handler = issue_handler
 
+    def execute_command(
+        self, runtime: Runtime, command: str, timeout: int | None = None
+    ) -> CmdOutputObservation:
+        """Execute a command in the runtime with optional timeout and retries.
+
+        Args:
+            runtime: Runtime instance to execute the command
+            command: Command to execute
+            error_msg: Error message template if command fails
+            timeout: Optional timeout in seconds
+
+        Returns:
+            CmdOutputObservation from successful command execution
+
+        Raises:
+            RuntimeError if command fails
+        """
+        action = CmdRunAction(command=command)
+        if timeout is not None:
+            action.set_hard_timeout(timeout)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = runtime.run_action(action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
+            raise RuntimeError(f'Failed to {command}. Observation: {obs}')
+        return obs
+
     def initialize_runtime(self, runtime: Runtime) -> None:
         """Initialize the runtime for the agent."""
         logger.info('-' * 30)
         logger.info('BEGIN Runtime Initialization')
         logger.info('-' * 30)
-        obs: Observation
 
-        action = CmdRunAction(command='cd /workspace')
-        logger.info(action, extra={'msg_type': 'ACTION'})
-        obs = runtime.run_action(action)
-        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-        if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
-            raise RuntimeError(f'Failed to change directory to /workspace.\n{obs}')
+        # Change to workspace directory
+        self.execute_command(runtime, 'cd /workspace')
 
+        # Set permissions for GitLab CI
         if self.platform == ProviderType.GITLAB and self.GITLAB_CI:
-            action = CmdRunAction(command='sudo chown -R 1001:0 /workspace/*')
-            logger.info(action, extra={'msg_type': 'ACTION'})
-            obs = runtime.run_action(action)
-            logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+            self.execute_command(runtime, 'sudo chown -R 1001:0 /workspace/*')
 
-        action = CmdRunAction(command='git config --global core.pager ""')
-        logger.info(action, extra={'msg_type': 'ACTION'})
-        obs = runtime.run_action(action)
-        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-        if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
-            raise RuntimeError(f'Failed to set git config.\n{obs}')
+        # Configure git
+        self.execute_command(runtime, 'git config --global core.pager ""')
 
     async def complete_runtime(
         self,
@@ -104,65 +118,44 @@ class IssueResolver:
         logger.info('-' * 30)
         logger.info('BEGIN Runtime Completion')
         logger.info('-' * 30)
-        obs: Observation
 
-        action = CmdRunAction(command='cd /workspace')
-        logger.info(action, extra={'msg_type': 'ACTION'})
-        obs = runtime.run_action(action)
-        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-        if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
-            raise RuntimeError(
-                f'Failed to change directory to /workspace. Observation: {obs}'
-            )
+        # Change to workspace directory
+        self.execute_command(runtime, 'cd /workspace')
 
-        action = CmdRunAction(command='git config --global core.pager ""')
-        logger.info(action, extra={'msg_type': 'ACTION'})
-        obs = runtime.run_action(action)
-        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-        if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
-            raise RuntimeError(f'Failed to set git config. Observation: {obs}')
+        # Configure git
+        self.execute_command(runtime, 'git config --global core.pager ""')
 
-        action = CmdRunAction(
-            command='git config --global --add safe.directory /workspace'
+        self.execute_command(
+            runtime, 'git config --global --add safe.directory /workspace'
         )
-        logger.info(action, extra={'msg_type': 'ACTION'})
-        obs = runtime.run_action(action)
-        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-        if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
-            raise RuntimeError(f'Failed to set git config. Observation: {obs}')
 
-        if self.platform == ProviderType.GITLAB and self.GITLAB_CI:
-            action = CmdRunAction(command='sudo git add -A')
-        else:
-            action = CmdRunAction(command='git add -A')
+        # Add all changes
+        git_add_cmd = (
+            'sudo git add -A'
+            if self.platform == ProviderType.GITLAB and self.GITLAB_CI
+            else 'git add -A'
+        )
+        self.execute_command(runtime, git_add_cmd)
 
-        logger.info(action, extra={'msg_type': 'ACTION'})
-        obs = runtime.run_action(action)
-        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-        if not isinstance(obs, CmdOutputObservation) or obs.exit_code != 0:
-            raise RuntimeError(f'Failed to git add. Observation: {obs}')
-
+        # Get git diff with retries
         n_retries = 0
         git_patch = None
         while n_retries < 5:
-            action = CmdRunAction(command=f'git diff --no-color --cached {base_commit}')
-            action.set_hard_timeout(600 + 100 * n_retries)
-            logger.info(action, extra={'msg_type': 'ACTION'})
-            obs = runtime.run_action(action)
-            logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-            n_retries += 1
-            if isinstance(obs, CmdOutputObservation):
-                if obs.exit_code == 0:
-                    git_patch = obs.content.strip()
-                    break
-                else:
-                    logger.info('Failed to get git diff, retrying...')
-                    await asyncio.sleep(10)
-            elif isinstance(obs, ErrorObservation):
-                logger.error(f'Error occurred: {obs.content}. Retrying...')
+            try:
+                obs = self.execute_command(
+                    runtime,
+                    f'git diff --no-color --cached {base_commit}',
+                    timeout=600 + 100 * n_retries,
+                )
+                git_patch = obs.content.strip()
+                break
+            except RuntimeError:
+                n_retries += 1
+                logger.info('Failed to get git diff, retrying...')
                 await asyncio.sleep(10)
-            else:
-                raise ValueError(f'Unexpected observation type: {type(obs)}')
+                continue
+            except Exception as e:
+                raise ValueError(f'Unexpected error type: {type(e)}')
 
         logger.info('-' * 30)
         logger.info('END Runtime Completion')
