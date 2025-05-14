@@ -167,12 +167,13 @@ def build_issue_resolver(args: Namespace) -> IssueResolver:
     )
 
 
-def int_or_none(value: str) -> int | None:
-    """Convert string to int or None."""
-    return int(value) if value is not None else None
-
-
 def main() -> None:
+    def int_or_none(value: str) -> int | None:
+        if value.lower() == 'none':
+            return None
+        else:
+            return int(value)
+
     parser = argparse.ArgumentParser(description='Resolve a single issue.')
     parser.add_argument(
         '--selected-repo',
